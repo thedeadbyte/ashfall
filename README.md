@@ -110,6 +110,7 @@ Set these in `configuration.nix` under `ashfall = { ... };`.
 | `desktop.enable` | `true` | GNOME |
 | `desktop.darkMode` | `true` | Dark style |
 | `desktop.wallpaper` | `null` | Path to an image, e.g. `./wallpaper.jpg` |
+| `desktop.downloadsOnly` | `true` | Create only `~/Downloads`, not Desktop/Documents/Music/Pictures/Projects/Public/Templates/Videos |
 | `yubikey.enable` | `false` | YubiKey tools and smart card support |
 | `yubikey.luksUnlock` | = `yubikey.enable` | Unlock the disk with a FIDO2 key |
 | `yubikey.identities` | `null` | Folder of age identity stubs (from `ashfall-secret init`) |
