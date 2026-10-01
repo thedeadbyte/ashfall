@@ -1,10 +1,17 @@
 # ashfall installer. Run from the NixOS live USB:
 #   sudo nix --extra-experimental-features 'nix-command flakes' run github:thedeadbyte/ashfall
 #
-# Asks a few questions, writes your machine config, erases and encrypts the
-# chosen disk, optionally enrolls YubiKeys, and installs.
+# Asks a few questions, writes your config, erases and encrypts the chosen
+# disk, optionally enrolls YubiKeys, and installs.
 #
-# Reinstall from a config you already have (skips the questions):
+# The config holds every machine you own: shared settings in hosts/common.nix,
+# one folder per machine in hosts/<name>/.
+#
+# Add another machine to a config you already have (asks only for a name and
+# a disk; everything else comes from hosts/common.nix):
+#   ... run github:thedeadbyte/ashfall -- --add-host /path/to/clone
+#
+# Reinstall a machine that is already in your config (skips the questions):
 #   ... run github:thedeadbyte/ashfall -- --config /path/to/clone --host NAME
 #
 # Environment (mostly for testing):
@@ -22,20 +29,25 @@ PASSFILE=/tmp/luks-recovery.pass
 USERNAME="" FULLNAME="" HOST="" TZONE="" KBD="" LOCALE="" DISK="" SWAP=""
 JS_SITES="" LUKS_PASS="" USER_PASS="" pick="" confirm=""
 export NIX_CONFIG="experimental-features = nix-command flakes"
-EXISTING="" EXISTING_HOST=""
+EXISTING="" EXISTING_HOST="" ADD_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) EXISTING=$(cd "${2:?--config needs a folder}" && pwd); shift 2 ;;
     --host) EXISTING_HOST=${2:?--host needs a name}; shift 2 ;;
+    --add-host) ADD_DIR=$(cd "${2:?--add-host needs a folder}" && pwd); shift 2 ;;
     -h|--help)
-      echo "Usage: ashfall-install                          (guided install)"
-      echo "       ashfall-install --config DIR --host NAME (install an existing config)"
+      echo "Usage: ashfall-install                          (guided install, first machine)"
+      echo "       ashfall-install --add-host DIR           (add this machine to your config)"
+      echo "       ashfall-install --config DIR --host NAME (reinstall a machine in your config)"
       exit 0 ;;
     *) echo "unknown argument: $1 (try --help)" >&2; exit 1 ;;
   esac
 done
+if [ -n "$ADD_DIR" ] && [ -n "$EXISTING$EXISTING_HOST" ]; then
+  echo "--add-host cannot be combined with --config or --host" >&2; exit 1
+fi
 if [ -n "$EXISTING" ] && [ -z "$EXISTING_HOST" ]; then
-  echo "--config also needs --host NAME (the nixosConfigurations name)" >&2; exit 1
+  echo "--config also needs --host NAME (a folder in hosts/)" >&2; exit 1
 fi
 PERSIST_CONFIG=1
 
@@ -46,7 +58,7 @@ else
   B=""; DIM=""; RED=""; GRN=""; YLW=""; RST=""
 fi
 step=0
-if [ -n "$EXISTING" ]; then TOTAL=5; else TOTAL=9; fi
+if [ -n "$ADD_DIR" ]; then TOTAL=6; elif [ -n "$EXISTING" ]; then TOTAL=5; else TOTAL=9; fi
 section() { step=$((step + 1)); printf '\n%s==> [%d/%d] %s%s\n' "$B" "$step" "$TOTAL" "$*" "$RST"; }
 info()    { printf '  %s\n' "$*"; }
 note()    { printf '  %s%s%s\n' "$DIM" "$*" "$RST"; }
@@ -103,6 +115,109 @@ ask_secret() {
 nixstr() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/\\$/g'; }
 nixbool() { if [ "$1" = 1 ]; then echo true; else echo false; fi; }
 
+# ask_name DIR: machine name; with DIR, refuse names already in DIR/hosts
+ask_name() {
+  local dir=${1:-} def=${2:-}
+  note "The machine's name: its hostname, and its folder in hosts/."
+  while true; do
+    ask HOST "Computer name (lowercase, e.g. laptop, desk)" "$def"
+    if ! [[ "$HOST" =~ ^[a-z][a-z0-9-]{0,30}[a-z0-9]$ ]]; then
+      echo "  use lowercase letters, digits and -, starting with a letter (2+ characters)"
+      continue
+    fi
+    if [ -n "$dir" ] && [ -d "$dir/hosts/$HOST" ]; then
+      if git -C "$dir" ls-files --error-unmatch "hosts/$HOST" >/dev/null 2>&1; then
+        echo "  $HOST is already in your config; pick another name"
+        echo "  (to reinstall it, use --config $dir --host $HOST instead)"
+        continue
+      fi
+      warn "reusing the unfinished hosts/$HOST from an earlier attempt"
+    fi
+    break
+  done
+}
+
+# choose_disk: sets DISK
+choose_disk() {
+  local live_disk="" src d i=0 manual
+  if src=$(findmnt -no SOURCE /iso 2>/dev/null); then
+    live_disk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1 || true)
+  fi
+  mapfile -t disks < <(lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' \
+    | grep -Ev '/(loop|zram|sr|ram)' | grep -vx "/dev/${live_disk:-none}" || true)
+  for d in "${disks[@]}"; do
+    i=$((i + 1))
+    printf '  %d) %-14s %8s  %s\n' "$i" "$d" "$(lsblk -dno SIZE "$d")" "$(lsblk -dno MODEL "$d" | xargs)"
+  done
+  manual=$((i + 1))
+  printf '  %d) type a device path\n' "$manual"
+  while true; do
+    ask pick "Install to which disk? (number)" ""
+    if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "$i" ]; then
+      DISK=${disks[$((pick - 1))]}; break
+    elif [ "$pick" = "$manual" ]; then
+      ask DISK "Device path (e.g. /dev/nvme0n1)" ""
+      if [ "$DRY_RUN" = 1 ] || [ -b "$DISK" ]; then break; fi
+      echo "  $DISK is not a block device"
+    else
+      echo "  pick a number from the list"
+    fi
+  done
+  ok "target: $DISK"
+}
+
+# choose_swap: sets SWAP
+choose_swap() {
+  note "Swap lets the system move idle memory to disk (in addition to compressed RAM)."
+  while true; do
+    ask SWAP "Swapfile size (e.g. 8G), or none" "8G"
+    if [[ "$SWAP" =~ ^[0-9]+[GM]$ ]] || [ "$SWAP" = none ]; then break; fi
+    echo "  use a size like 8G or 512M, or none"
+  done
+}
+
+# write_host DIR: writes DIR/hosts/$HOST/{default,hardware}.nix for $DISK/$SWAP
+write_host() {
+  local hdir="$1/hosts/$HOST" swap_nix
+  if [ "$SWAP" = none ]; then swap_nix=null; else swap_nix="\"$SWAP\""; fi
+  mkdir -p "$hdir"
+  cat > "$hdir/default.nix" <<EOF
+# This machine ($HOST) only. Settings shared by all your machines are in
+# ../common.nix; the hostname is this folder's name.
+{ pkgs, ... }:
+
+{
+  imports = [ ./hardware.nix ];
+
+  # Set when this machine was installed. Don't change them afterwards.
+  ashfall.disk.device = "$(nixstr "$DISK")";
+  ashfall.disk.swapSize = $swap_nix;
+
+  # Settings for this machine only go here, for example:
+  #   ashfall.wipeHome = false;
+  #   environment.systemPackages = with pkgs; [ ];
+
+  system.stateVersion = "$STATE_VERSION"; # Do not change after install
+}
+EOF
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '{ lib, ... }: { nixpkgs.hostPlatform = lib.mkDefault "x86_64-linux"; }\n' > "$hdir/hardware.nix"
+  else
+    nixos-generate-config --no-filesystems --show-hardware-config > "$hdir/hardware.nix" 2>/dev/null
+  fi
+}
+
+# git identity for commits made by the installer (root on the USB usually has none)
+git_identity() {
+  local dir=$1 n e
+  n=$(git -C "$dir" config user.name 2>/dev/null || true)
+  e=$(git -C "$dir" config user.email 2>/dev/null || true)
+  [ -z "$n" ] && n=$(git -C "$dir" log -1 --format=%an 2>/dev/null || true)
+  [ -z "$e" ] && e=$(git -C "$dir" log -1 --format=%ae 2>/dev/null || true)
+  git -C "$dir" config user.name "${n:-${FULLNAME:-ashfall}}"
+  git -C "$dir" config user.email "${e:-${USERNAME:-ashfall}@${HOST:-ashfall}.local}"
+}
+
 cat <<EOF
 
 ${B}ashfall installer${RST}
@@ -128,6 +243,27 @@ else
   ok "skipped (dry run)"
 fi
 
+if [ -n "$ADD_DIR" ]; then
+# ---------- 2''. add this machine to an existing config ----------
+section "Adding this machine to $ADD_DIR"
+[ -f "$ADD_DIR/flake.nix" ] || die "no flake.nix in $ADD_DIR"
+git -C "$ADD_DIR" rev-parse >/dev/null 2>&1 || die "$ADD_DIR must be a git clone of your config"
+[ -f "$ADD_DIR/hosts/common.nix" ] || die "$ADD_DIR has no hosts/common.nix; --add-host needs the multi-machine layout (see the README)"
+have=$(find "$ADD_DIR/hosts" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null || true)
+info "machines already in it: ${have:-none}"
+echo
+ask_name "$ADD_DIR" ""
+echo
+choose_disk
+echo
+choose_swap
+write_host "$ADD_DIR"
+git -C "$ADD_DIR" add "hosts/$HOST"
+ok "wrote hosts/$HOST (default.nix, hardware.nix)"
+EXISTING=$ADD_DIR
+EXISTING_HOST=$HOST
+fi
+
 if [ -n "$EXISTING" ]; then
 # ---------- 2'. read an existing config ----------
 section "Reading $EXISTING#$EXISTING_HOST"
@@ -135,7 +271,7 @@ section "Reading $EXISTING#$EXISTING_HOST"
 git -C "$EXISTING" rev-parse >/dev/null 2>&1 || die "$EXISTING must be a git clone (flakes only see tracked files)"
 opt() { nix eval --raw "$EXISTING#nixosConfigurations.$EXISTING_HOST.config.$1" 2>/dev/null; }
 optb() { if [ "$(nix eval --json "$EXISTING#nixosConfigurations.$EXISTING_HOST.config.$1" 2>/dev/null)" = true ]; then echo 1; else echo 0; fi; }
-info "evaluating (downloads sources on first run)..."
+info "evaluating $EXISTING_HOST (downloads sources on first run)..."
 USERNAME=$(opt ashfall.user.name) || die "could not evaluate $EXISTING_HOST; is it an ashfall config?"
 FULLNAME=$(opt ashfall.user.description)
 HOST=$(opt networking.hostName)
@@ -167,11 +303,7 @@ while true; do
   echo "  use lowercase letters, digits, - or _, starting with a letter"
 done
 ask FULLNAME "Full name (shown at login)" "$USERNAME"
-while true; do
-  ask HOST "Computer name" "ashfall"
-  [[ "$HOST" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] && break
-  echo "  use letters, digits and -"
-done
+ask_name "" "ashfall"
 detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
 while true; do
   ask TZONE "Time zone (e.g. America/New_York)" "${detected_tz:-UTC}"
@@ -183,39 +315,9 @@ ask LOCALE "Language/locale" "en_US.UTF-8"
 
 # ---------- 3. disk ----------
 section "Disk"
-live_disk=""
-if src=$(findmnt -no SOURCE /iso 2>/dev/null); then
-  live_disk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1 || true)
-fi
-mapfile -t disks < <(lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' \
-  | grep -Ev '/(loop|zram|sr|ram)' | grep -vx "/dev/${live_disk:-none}" || true)
-i=0
-for d in "${disks[@]}"; do
-  i=$((i + 1))
-  printf '  %d) %-14s %8s  %s\n' "$i" "$d" "$(lsblk -dno SIZE "$d")" "$(lsblk -dno MODEL "$d" | xargs)"
-done
-manual=$((i + 1))
-printf '  %d) type a device path\n' "$manual"
-while true; do
-  ask pick "Install to which disk? (number)" ""
-  if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "$i" ]; then
-    DISK=${disks[$((pick - 1))]}; break
-  elif [ "$pick" = "$manual" ]; then
-    ask DISK "Device path (e.g. /dev/nvme0n1)" ""
-    if [ "$DRY_RUN" = 1 ] || [ -b "$DISK" ]; then break; fi
-    echo "  $DISK is not a block device"
-  else
-    echo "  pick a number from the list"
-  fi
-done
-ok "target: $DISK"
-
-note "Swap lets the system move idle memory to disk (in addition to compressed RAM)."
-while true; do
-  ask SWAP "Swapfile size (e.g. 8G), or none" "8G"
-  if [[ "$SWAP" =~ ^[0-9]+[GM]$ ]] || [ "$SWAP" = none ]; then break; fi
-  echo "  use a size like 8G or 512M, or none"
-done
+choose_disk
+echo
+choose_swap
 
 # ---------- 4. security ----------
 section "Security"
@@ -230,7 +332,7 @@ YUBI=0; yesno "Unlock the disk with a YubiKey?" n && YUBI=1
 
 # ---------- 5. extras ----------
 section "Optional features"
-note "Each group can be turned on or off later in configuration.nix."
+note "Each group can be turned on or off later in hosts/common.nix."
 echo
 info "${B}Hardened Firefox${RST}: uBlock Origin, telemetry off, JavaScript off by default"
 info "(you allow it per site), Firefox as default browser with vertical tabs."
@@ -306,37 +408,46 @@ mkdir -p "$OUT"
 
 sites_nix=""
 for s in $JS_SITES; do sites_nix="$sites_nix\"$(nixstr "$s")\" "; done
-if [ "$SWAP" = none ]; then swap_nix=null; else swap_nix="\"$SWAP\""; fi
+mkdir -p "$OUT/hosts"
 
 cat > "$OUT/flake.nix" <<EOF
 {
-  description = "$(nixstr "$HOST"): built on ashfall";
+  description = "My machines, built on ashfall";
 
   inputs = {
     ashfall.url = "$(nixstr "$ASHFALL_FLAKE")";
     nixpkgs.follows = "ashfall/nixpkgs";
   };
 
-  outputs = { ashfall, nixpkgs, ... }: {
-    nixosConfigurations."$(nixstr "$HOST")" = nixpkgs.lib.nixosSystem {
-      modules = [
-        ashfall.nixosModules.default
-        ./hardware.nix
-        ./configuration.nix
-      ];
+  outputs = { ashfall, nixpkgs, ... }:
+    let
+      inherit (nixpkgs) lib;
+      # Every folder in hosts/ is one machine, and its name is the hostname.
+      # Add a machine with: nix run github:thedeadbyte/ashfall -- --add-host .
+      hosts = lib.filterAttrs (_: type: type == "directory") (builtins.readDir ./hosts);
+    in
+    {
+      nixosConfigurations = lib.mapAttrs (name: _: lib.nixosSystem {
+        modules = [
+          ashfall.nixosModules.default
+          ./hosts/common.nix
+          (./hosts + "/\${name}")
+          { networking.hostName = name; }
+        ];
+      }) hosts;
     };
-  };
 }
 EOF
 
-cat > "$OUT/configuration.nix" <<EOF
-# Written by the ashfall installer on $(date +%Y-%m-%d). Edit freely, then apply:
+cat > "$OUT/hosts/common.nix" <<EOF
+# Shared by every machine in hosts/. Written by the ashfall installer on
+# $(date +%Y-%m-%d). Edit freely, then apply on each machine with:
 #   sudo nixos-rebuild switch
+# Settings for one machine only go in hosts/<name>/default.nix.
 # Every option is documented at https://github.com/thedeadbyte/ashfall
 { pkgs, ... }:
 
 {
-  networking.hostName = "$(nixstr "$HOST")";
   time.timeZone = "$(nixstr "$TZONE")";
   i18n.defaultLocale = "$(nixstr "$LOCALE")";
   services.xserver.xkb.layout = "$(nixstr "$KBD")";
@@ -345,8 +456,6 @@ cat > "$OUT/configuration.nix" <<EOF
   ashfall = {
     user.name = "$USERNAME";
     user.description = "$(nixstr "$FULLNAME")";
-    disk.device = "$(nixstr "$DISK")";
-    disk.swapSize = $swap_nix;
 
     wipeHome = $(nixbool "$WIPE_HOME");
     persistConfig = true; # keeps /etc/nixos across reboots
@@ -370,29 +479,27 @@ cat > "$OUT/configuration.nix" <<EOF
     persist.userDirectories = [ ];
   };
 
-  # Your packages (search: https://search.nixos.org/packages)
+  # Your packages, on every machine (search: https://search.nixos.org/packages)
   environment.systemPackages = with pkgs; [ ];
-
-  system.stateVersion = "$STATE_VERSION"; # Do not change after install
 }
 EOF
 
-if [ "$DRY_RUN" = 1 ]; then
-  printf '{ lib, ... }: { nixpkgs.hostPlatform = lib.mkDefault "x86_64-linux"; }\n' > "$OUT/hardware.nix"
-else
-  nixos-generate-config --no-filesystems --show-hardware-config > "$OUT/hardware.nix" 2>/dev/null
-fi
-ok "wrote flake.nix, configuration.nix, hardware.nix"
+write_host "$OUT"
+ok "wrote flake.nix, hosts/common.nix, hosts/$HOST/"
 
-git -C "$OUT" init -q
+git -C "$OUT" init -q -b main
+git_identity "$OUT"
+if [ "$DRY_RUN" != 1 ]; then
+  info "pinning versions (flake.lock)..."
+  git -C "$OUT" add -A
+  nix flake lock "$OUT"
+fi
 git -C "$OUT" add -A
+git -C "$OUT" commit -qm "ashfall: first machine ($HOST)"
 if [ "$DRY_RUN" = 1 ]; then
   ok "dry run complete: $OUT"
   exit 0
 fi
-info "pinning versions (flake.lock)..."
-nix flake lock "$OUT"
-git -C "$OUT" add -A
 ok "config ready"
 fi
 
@@ -454,6 +561,21 @@ info "installing NixOS..."
 nixos-install --root /mnt --flake "$OUT#$HOST" --no-root-passwd --no-channel-copy
 ok "installed"
 
+if [ -n "$ADD_DIR" ]; then
+  info "saving hosts/$HOST to your config repo..."
+  git_identity "$OUT"
+  git -C "$OUT" commit -qm "Add machine $HOST" -- "hosts/$HOST"
+  if [ "$PERSIST_CONFIG" = 1 ]; then
+    cp -a "$OUT/.git/." /mnt/persist/etc/nixos/.git/
+  fi
+  if GIT_TERMINAL_PROMPT=0 git -C "$OUT" push -q 2>/dev/null; then
+    ok "committed and pushed hosts/$HOST"
+  else
+    warn "committed hosts/$HOST but could not push it (not signed in to GitHub?)"
+    warn "push it later from this machine: sudo git -C /etc/nixos push"
+  fi
+fi
+
 swapoff /mnt/.swapvol/swapfile 2>/dev/null || true
 umount -R /mnt
 cryptsetup close cryptroot 2>/dev/null || true
@@ -465,7 +587,11 @@ ${GRN}${B}Done.${RST} Remove the USB stick and reboot.
   At boot:  $( [ "$YUBI" = 1 ] && echo "plug in a YubiKey, enter its PIN, touch it (or type the passphrase)" || echo "type your disk passphrase" )
   Log in:   $USERNAME
   Config:   $( [ "$PERSIST_CONFIG" = 1 ] && echo "/etc/nixos   (edit, then: sudo nixos-rebuild switch)" || echo "not kept on disk; clone your repo to edit and rebuild" )
-  Keep it:  push your config to a private git repo so you can rebuild anywhere
+EOF
+if [ -z "$EXISTING" ]; then
+  echo "  Keep it:  push /etc/nixos to a private git repo; the README shows how"
+fi
+cat <<EOF
 
 Everything outside /etc/nixos and the persist list resets on every reboot.
 EOF

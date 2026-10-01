@@ -3,7 +3,7 @@
 #   ashfall-secret init [dir]        set up an age identity on each plugged-in key
 #   ashfall-secret add NAME [dir]    encrypt a secret to all enrolled keys
 #
-# dir defaults to ./secrets (run it from your config folder, e.g. /etc/nixos).
+# dir defaults to ./secrets (run it from the top of your config, e.g. /etc/nixos).
 # Identity stubs and .age files are safe to commit: they decrypt nothing
 # without a physical YubiKey and its PIV PIN.
 
@@ -56,8 +56,8 @@ cmd_init() {
   echo "  $(wc -l < "$dir/recipients.txt") recipient(s) in $dir/recipients.txt"
   cat <<EOF
 
-Done. Add to your configuration.nix:
-  ashfall.yubikey.identities = ./$(basename "$dir")/identities;
+Done. Add to hosts/common.nix (paths are relative to that file):
+  ashfall.yubikey.identities = ../$(basename "$dir")/identities;
 Then create a secret with: ashfall-secret add NAME $dir
 Secrets made before adding a key are not readable by that key; re-run add.
 EOF
@@ -95,10 +95,10 @@ cmd_add() {
 
   cat <<EOF
 
-Done. Add to your configuration.nix:
-  ashfall.yubikey.clipSecrets.$name.file = ./$(basename "$dir")/$name.age;
+Done. Add to hosts/common.nix (paths are relative to that file):
+  ashfall.yubikey.clipSecrets.$name.file = ../$(basename "$dir")/$name.age;
 then track the new file and rebuild:
-  git add -A && sudo nixos-rebuild switch
+  sudo git add -A && sudo nixos-rebuild switch
 Running '$name' will then copy it to the clipboard for one paste.
 EOF
 }

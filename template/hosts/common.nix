@@ -1,10 +1,10 @@
-# Machine config built on ashfall. Edit, then apply with:
+# Shared by every machine in hosts/. Edit, then apply on each machine with:
 #   sudo nixos-rebuild switch
+# Settings for one machine only go in hosts/<name>/default.nix.
 # The installer writes a filled-in copy of this file for you.
 { pkgs, ... }:
 
 {
-  networking.hostName = "ashfall"; # must match the name in flake.nix
   time.timeZone = "UTC";
   i18n.defaultLocale = "en_US.UTF-8";
   services.xserver.xkb.layout = "us";
@@ -12,8 +12,6 @@
 
   ashfall = {
     user.name = "alice";
-    disk.device = "/dev/nvme0n1"; # erased by the installer
-    disk.swapSize = "8G";         # null for no swapfile
 
     # Wipe /home on every boot too (recommended)
     wipeHome = true;
@@ -45,8 +43,6 @@
     persist.userDirectories = [ ];
   };
 
-  # Your packages
+  # Your packages, on every machine
   environment.systemPackages = with pkgs; [ ];
-
-  system.stateVersion = "26.05"; # Do not change after install
 }

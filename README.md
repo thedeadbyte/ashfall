@@ -6,6 +6,8 @@ Every reboot wipes the system (and, by default, your home folder) and rebuilds i
 
 ashfall is a set of NixOS modules plus a guided installer. You answer a few questions, and it erases one disk, encrypts it, and installs a GNOME desktop with your choices.
 
+One config can run all your computers. Shared settings live in one file, so a change made once applies to every machine at its next rebuild.
+
 ## What you get
 
 - **Wipe on boot.** `/` is recreated empty on every boot, and so is `/home` unless you turn that off. NixOS rebuilds everything from `/nix`.
@@ -64,20 +66,30 @@ The installer asks for:
 
 It shows a summary and does nothing until you type the disk's name to confirm. Then it partitions and encrypts the disk, enrolls your YubiKeys one at a time if you chose that, and installs. Remove the USB and reboot.
 
+To put a second computer on the same config, see [More than one machine](#more-than-one-machine).
+
 > **Write down the disk passphrase.** If you lose it, and your YubiKeys if you use them, the data is unrecoverable. That's the point of encryption.
 
 ## Daily use
 
-Your config is in `/etc/nixos`. To change something, edit it and apply:
+Your config is in `/etc/nixos`:
+
+```
+flake.nix              finds every machine in hosts/
+hosts/common.nix       settings for all your machines: features, apps, user, time zone
+hosts/<name>/          this machine only: disk, hardware, one-off settings
+```
+
+To change something, edit it and apply:
 
 ```bash
-sudo nano /etc/nixos/configuration.nix   # or any editor
+sudo nano /etc/nixos/hosts/common.nix   # or any editor
 sudo nixos-rebuild switch
 ```
 
 `/etc/nixos` is a git repository, and flakes only see files git knows about. After **adding a new file** (an image, a secret, another `.nix` file), run `sudo git -C /etc/nixos add -A` before rebuilding.
 
-To add an app, look it up at [search.nixos.org](https://search.nixos.org/packages), add it to `environment.systemPackages`, and rebuild.
+To add an app, look it up at [search.nixos.org](https://search.nixos.org/packages), add it to `environment.systemPackages` in `hosts/common.nix`, and rebuild.
 
 To update, pull the newest ashfall and nixpkgs, then rebuild:
 
@@ -89,11 +101,65 @@ sudo nixos-rebuild switch
 
 If an update breaks something, choose an older generation in the boot menu.
 
-**Back up your config.** Push `/etc/nixos` to a *private* git repository. With it, you can reinstall an identical machine at any time (see [Reinstalling](#reinstalling-from-your-own-config)).
+`/etc/nixos` belongs to root on purpose. Something running as you can't change the config that survives reboots.
+
+### Back up your config
+
+Push `/etc/nixos` to a **private** GitHub repository. With it, you can reinstall any machine and add new ones. Once:
+
+```bash
+sudo nix-shell -p gh --run 'gh auth login && gh auth setup-git && gh repo create my-ashfall --private --source /etc/nixos --push'
+```
+
+After that, save changes with:
+
+```bash
+sudo git -C /etc/nixos commit -am "what changed"
+sudo git -C /etc/nixos push
+```
+
+Sign-ins don't survive a reboot, so after each boot sign in once before you push or pull:
+
+```bash
+sudo nix-shell -p gh --run 'gh auth login && gh auth setup-git'
+```
+
+The installer set the commit name and email from your answers. Change them with `sudo git -C /etc/nixos config user.email you@example.com`.
+
+## More than one machine
+
+Every machine uses the same `hosts/common.nix`. Each one also gets its own folder in `hosts/` for its disk and hardware.
+
+**Add a machine.** On the new computer, boot the NixOS installer USB, connect to Wi-Fi, and open a terminal:
+
+```bash
+sudo -i
+nix-shell -p gh git
+gh auth login
+gh auth setup-git
+gh repo clone you/my-ashfall /tmp/config
+nix --extra-experimental-features 'nix-command flakes' run github:thedeadbyte/ashfall -- --add-host /tmp/config
+```
+
+It asks for this machine's name and which disk to erase. Everything else comes from `hosts/common.nix`. Then it asks for a disk passphrase and login password for this machine, enrolls your YubiKeys if you use them, and installs. When the install succeeds, it commits `hosts/<name>/` and pushes it to your repo.
+
+**Keep them in sync.** Make a change on any machine, then commit and push it (see [Back up your config](#back-up-your-config)). On each of the other machines:
+
+```bash
+sudo nix-shell -p gh --run 'gh auth login && gh auth setup-git'   # once per boot
+sudo git -C /etc/nixos pull
+sudo nixos-rebuild switch
+```
+
+Updates work the same way. Run `sudo nix flake update` on one machine, then commit and push the new `flake.lock`. Every machine that pulls it builds the same versions.
+
+**Per-machine differences** go in `hosts/<name>/default.nix`. For example, `ashfall.wipeHome = false;` there affects that machine only.
+
+Disk passphrases, login passwords, and YubiKey disk-unlock enrollments are separate for each machine. YubiKey secrets made with `ashfall-secret` are tied to the keys, not to a machine, so the same keys open them everywhere.
 
 ## Options
 
-Set these in `configuration.nix` under `ashfall = { ... };`.
+Set these under `ashfall = { ... };` in `hosts/common.nix` for all machines, or in `hosts/<name>/default.nix` for one. `disk.*` belongs in the machine's own file.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -142,7 +208,7 @@ sudo ashfall-secret init            # once: creates an identity on each plugged-
 sudo ashfall-secret add vault-pw    # prompts for the secret, encrypts it to all keys
 ```
 
-Then add the two lines it prints to `configuration.nix`, run `sudo git -C /etc/nixos add -A`, and rebuild. From then on, running `vault-pw` asks for the key's PIN and a touch, then copies the password for a single paste. The clipboard clears after 20 seconds.
+Then add the two lines it prints to `hosts/common.nix`, run `sudo git -C /etc/nixos add -A`, and rebuild. From then on, running `vault-pw` asks for the key's PIN and a touch, then copies the password for a single paste. The clipboard clears after 20 seconds.
 
 The `.age` files and identity stubs are safe to commit. Without a physical key and its PIN, they decrypt nothing.
 
@@ -156,7 +222,7 @@ gh repo clone you/your-config /tmp/config
 sudo nix --extra-experimental-features 'nix-command flakes' run github:thedeadbyte/ashfall -- --config /tmp/config --host <name>
 ```
 
-This skips the questions, reads everything from your config, asks only for the passphrase and password, then erases the disk and installs.
+`<name>` is the machine's folder in `hosts/`. This skips the questions, reads everything from your config, asks only for the passphrase and password, then erases the disk and installs.
 
 ## Using ashfall in an existing flake
 
@@ -168,7 +234,9 @@ inputs.nixpkgs.follows = "ashfall/nixpkgs";
 ashfall.nixosModules.default
 ```
 
-Or start from the template: `nix flake init -t github:thedeadbyte/ashfall`.
+Or start from the template, which has the same layout the installer writes: `nix flake init -t github:thedeadbyte/ashfall`.
+
+Configs made by the first release (`flake.nix` + `configuration.nix` in one folder) keep working. `--add-host` needs the `hosts/` layout. To switch, copy the template's `flake.nix`, move the shared parts of `configuration.nix` to `hosts/common.nix`, and move `hardware.nix`, the `disk.*` lines and `system.stateVersion` into `hosts/<name>/`. The folder name must match the old `networking.hostName`. Then delete that line.
 
 ## What this protects against, and what it doesn't
 
@@ -185,7 +253,7 @@ Or start from the template: `nix flake init -t github:thedeadbyte/ashfall`.
 
 ## Limitations
 
-GNOME only, x86_64 only, one user, and one whole disk. The disk layout (partition labels, the `cryptroot` mapper name, and subvolume names) is fixed once installed.
+GNOME only, x86_64 only, one user (the same one on every machine), and one whole disk per machine. The disk layout (partition labels, the `cryptroot` mapper name, and subvolume names) is fixed once installed.
 
 ## Forking
 

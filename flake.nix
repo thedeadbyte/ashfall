@@ -54,7 +54,7 @@
       # nix flake init -t github:thedeadbyte/ashfall
       templates.default = {
         path = ./template;
-        description = "ashfall machine config";
+        description = "ashfall config: shared hosts/common.nix plus one folder per machine";
       };
 
       # sudo nix run github:thedeadbyte/ashfall   (from the NixOS live USB)
@@ -71,8 +71,9 @@
       nixosConfigurations.example = lib.nixosSystem {
         modules = [
           self.nixosModules.default
-          ./template/hardware.nix
-          ./template/configuration.nix
+          ./template/hosts/common.nix
+          ./template/hosts/laptop
+          { networking.hostName = "laptop"; }
         ];
       };
     };
